@@ -5,14 +5,18 @@ import tempfile
 import json
 from datetime import datetime
 import time
+import traceback
 
 # Import Google Cloud and LangChain packages
 import vertexai
-from vertexai.generative_models import GenerativeModel
-from vertexai.language_models import TextEmbeddingModel
+from vertexai.language_models import TextEmbeddingModel, TextGenerationModel
 from langchain_community.vectorstores import Chroma
 from langchain_google_vertexai import VertexAIEmbeddings
 from langchain.schema import Document
+
+# Import Google Generative AI SDK
+from google import genai
+from google.genai.types import HttpOptions
 
 # Set page configuration
 st.set_page_config(
@@ -36,15 +40,140 @@ if "api_initialized" not in st.session_state:
     st.session_state.api_initialized = False
 if "batch_results" not in st.session_state:
     st.session_state.batch_results = None
+if "genai_client" not in st.session_state:
+    st.session_state.genai_client = None
+
+
+def setup_authentication():
+    """Helper function to set up authentication for Vertex AI"""
+    import os
+    
+    # Display authentication status
+    st.sidebar.subheader("Authentication Status")
+    
+    # Check if GOOGLE_APPLICATION_CREDENTIALS is set
+    creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    
+    if creds_path:
+        st.sidebar.success(f"✅ Found credentials at: {creds_path}")
+    else:
+        st.sidebar.warning("⚠️ GOOGLE_APPLICATION_CREDENTIALS environment variable not set")
+        
+        # Add service account key uploader
+        st.sidebar.subheader("Upload Service Account Key")
+        uploaded_key = st.sidebar.file_uploader("Service Account JSON Key", type=["json"])
+        
+        if uploaded_key is not None:
+            # Save the uploaded key to a temporary file
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.json') as tmp_file:
+                tmp_file.write(uploaded_key.getvalue())
+                key_path = tmp_file.name
+            
+            # Set environment variable
+            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = key_path
+            st.sidebar.success(f"✅ Credentials set from uploaded key: {key_path}")
+            
+            # Add a rerun button to apply the credentials
+            if st.sidebar.button("Apply Credentials"):
+                st.experimental_rerun()
+        
+        # Add instructions for authentication
+        with st.sidebar.expander("Authentication Instructions"):
+            st.markdown("""
+            ### How to Authenticate with Google Cloud
+            
+            **Option 1: Using gcloud CLI (Recommended)**
+            
+            1. Install [Google Cloud SDK](https://cloud.google.com/sdk/docs/install)
+            2. Open a terminal and run:
+            ```
+            gcloud auth application-default login
+            ```
+            3. Follow the browser prompts to log in
+            
+            **Option 2: Using a Service Account Key**
+            
+            1. In Google Cloud Console, go to IAM & Admin > Service Accounts
+            2. Create a service account or select an existing one
+            3. Add the "Vertex AI User" role
+            4. Create and download a JSON key
+            5. Upload the key using the file uploader above
+            
+            **Option 3: Set Environment Variable**
+            
+            1. Set the GOOGLE_APPLICATION_CREDENTIALS environment variable:
+            ```
+            # Windows
+            set GOOGLE_APPLICATION_CREDENTIALS=path/to/key.json
+            
+            # macOS/Linux
+            export GOOGLE_APPLICATION_CREDENTIALS=path/to/key.json
+            ```
+            2. Restart this application
+            """)
+    
+    # Return True if authenticated, False otherwise
+    return creds_path is not None
 
 
 def initialize_vertex_ai(project_id, location):
-    """Initialize Vertex AI API"""
-    vertexai.init(project=project_id, location=location)
-    st.session_state.api_initialized = True
-    st.session_state.project_id = project_id
-    st.session_state.location = location
-    st.success("✅ Vertex AI API initialized successfully!")
+    """Initialize Vertex AI API and GenAI Client"""
+    try:
+        # Set project and location
+        vertexai.init(project=project_id, location=location)
+        
+        # Set environment variables for GenAI SDK
+        os.environ["GOOGLE_CLOUD_PROJECT"] = project_id
+        os.environ["GOOGLE_CLOUD_LOCATION"] = location
+        os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "True"
+        
+        # Initialize the GenAI client
+        try:
+            client = genai.Client(http_options=HttpOptions(api_version="v1"))
+            
+            # Test the client with a simple request
+            response = client.models.generate_content(
+                model="gemini-2.0-flash-001",
+                contents="Respond with only one word: Hello",
+            )
+            
+            if response and hasattr(response, 'text'):
+                st.success(f"✅ Successfully initialized Gemini 2.0 Flash model")
+                st.session_state.genai_client = client
+                st.session_state.api_initialized = True
+                st.session_state.project_id = project_id
+                st.session_state.location = location
+                st.session_state.model_name = "gemini-2.0-flash-001"
+                return True
+            else:
+                st.error("⚠️ Gemini model returned unexpected response format")
+                return False
+                
+        except Exception as model_error:
+            st.error(f"Error initializing Gemini model: {str(model_error)}")
+            st.error("""
+            There was an error accessing the Gemini model. This could be due to:
+            1. Insufficient permissions for your account
+            2. The Vertex AI API not being fully enabled
+            3. Billing not being set up for the project
+            4. The model not being available in the selected region
+            
+            Please check these settings in your Google Cloud Console.
+            """)
+            st.session_state.api_initialized = False
+            return False
+            
+    except Exception as e:
+        st.error(f"Error initializing Vertex AI: {str(e)}")
+        st.error("""
+        Authentication failed. Please check:
+        1. Your Google Cloud Project ID is correct
+        2. You have authenticated with gcloud CLI using: gcloud auth application-default login
+        3. The Vertex AI API is enabled in your project
+        4. You have the necessary permissions (at least Vertex AI User role)
+        """)
+        st.session_state.api_initialized = False
+        return False
 
 
 def load_dataset(uploaded_file):
@@ -78,15 +207,48 @@ def create_vector_store(dataset):
     """Create vector store from dataset using Vertex AI embeddings"""
     with st.spinner("Creating embeddings and vector store... This may take a while depending on the dataset size."):
         try:
-            # Initialize embedding model
-            embedding_model = VertexAIEmbeddings(
-                model_name="text-embedding-005",
-                project=st.session_state.project_id,
-                location=st.session_state.location,
-            )
+            # Check if project_id and location are set
+            if not st.session_state.project_id or not st.session_state.location:
+                st.error("Project ID or location not set. Please initialize Vertex AI API first.")
+                return None
+                
+            # Initialize embedding model with detailed error handling
+            try:
+                embedding_model = VertexAIEmbeddings(
+                    model_name="text-embedding-005",
+                    project=st.session_state.project_id,
+                    location=st.session_state.location,
+                )
+                
+                # Test the embedding model with a simple example
+                test_embedding = embedding_model.embed_query("test query")
+                if not test_embedding or len(test_embedding) == 0:
+                    st.error("Embedding model returned empty embedding. Authentication may be incorrect.")
+                    return None
+                    
+                st.success("✅ Successfully connected to Vertex AI Embeddings API")
+                
+            except Exception as embed_error:
+                st.error(f"Error initializing embedding model: {str(embed_error)}")
+                st.info("""
+                ### Embedding Model Error
+                
+                This usually means one of the following:
+                1. The Vertex AI API is not enabled for your project
+                2. Your authentication credentials are incorrect
+                3. Your account doesn't have permission to use Vertex AI Embeddings
+                4. You haven't completed the billing setup for your Google Cloud project
+                
+                Check these settings in your Google Cloud Console.
+                """)
+                return None
             
             # Create documents for vector store
+            st.info("Creating document embeddings for the dataset...")
+            
             documents = []
+            progress_bar = st.progress(0)
+            
             for idx, row in dataset.iterrows():
                 content = row["prompt"]
                 metadata = {
@@ -95,8 +257,16 @@ def create_vector_store(dataset):
                 }
                 doc = Document(page_content=content, metadata=metadata)
                 documents.append(doc)
+                
+                # Update progress
+                progress = (idx + 1) / len(dataset)
+                progress_bar.progress(progress)
+            
+            progress_bar.empty()
             
             # Create vector store
+            st.info("Creating vector store from embeddings...")
+            
             vector_store = Chroma.from_documents(
                 documents=documents,
                 embedding=embedding_model,
@@ -113,6 +283,11 @@ def create_vector_store(dataset):
 def get_similar_prompts(vector_store, query_text, top_k=5):
     """Get similar prompts from vector store"""
     try:
+        # Check if vector_store is None
+        if vector_store is None:
+            st.error("Vector store is not initialized. Please create the vector store first.")
+            return []
+            
         # Search vector store for similar prompts
         results = vector_store.similarity_search_with_score(
             query=query_text,
@@ -128,55 +303,86 @@ def get_similar_prompts(vector_store, query_text, top_k=5):
                 "index": doc.metadata["index"]
             })
         
+        # Check if we found any examples
+        if not similar_examples:
+            st.warning(f"No similar examples found for: '{query_text[:50]}...'")
+        
         return similar_examples
     
     except Exception as e:
         st.error(f"Error retrieving similar prompts: {str(e)}")
+        st.error(f"Debug info - Vector store type: {type(vector_store)}")
         return []
 
 
-def classify_prompt_with_rag(prompt, similar_examples, model_name):
-    """Classify prompt using RAG and Vertex AI model"""
+def classify_prompt_with_rag(prompt, similar_examples):
+    """Classify prompt using RAG and Gemini 2.0 Flash with improved instructions"""
     try:
-        # Create context from similar examples
-        context = "Here are similar examples with their classifications:\n\n"
-        for i, example in enumerate(similar_examples):
-            context += f"Example {i+1}: \"{example['prompt']}\"\n"
-            context += f"Classification: {example['label']}\n\n"
+        # Check if similar_examples is None or empty
+        if not similar_examples:
+            st.warning("No similar examples found. Using direct classification without RAG context.")
+            similar_examples = []
+            context = "No similar examples found. Please classify based on the guidelines below.\n\n"
+        else:
+            # Create context from similar examples
+            context = "Here are similar examples with their classifications:\n\n"
+            for i, example in enumerate(similar_examples):
+                context += f"Example {i+1}: \"{example['prompt']}\"\n"
+                context += f"Classification: {example['label']}\n\n"
         
-        # Create prompt with RAG context
+        # Create prompt with RAG context and better classification guidelines
         rag_prompt = f"""{context}
-Based on the examples above, classify the following text as either hate speech or not hate speech.
-Respond with just the classification label (hate_speech or not_hate_speech).
+Your task is to classify the following text as either "hate_speech" or "not_hate_speech".
+
+Guidelines for classification:
+1. Hate speech: Content that expresses, incites, or promotes hatred, violence, or prejudicial stereotypes against protected groups based on attributes such as race, ethnicity, gender, religion, sexual orientation, or disability.
+2. Not hate speech: Content that may be critical or negative but doesn't target protected groups or express/promote hatred, violence, or discrimination.
+
+Analyze the text carefully and avoid overgeneralizing. A text isn't hate speech simply because it contains criticism, strong language, or controversial opinions if it doesn't target or demean protected groups.
 
 Text to classify: "{prompt}"
 
-Classification:"""
+Respond with ONLY one of these two labels:
+- hate_speech
+- not_hate_speech
+"""
         
-        # Initialize model
-        model = GenerativeModel(model_name)
-        
-        # Generate response
-        response = model.generate_content(rag_prompt)
-        
-        # Extract and normalize classification
-        result = response.text.strip().lower()
-        
-        # Ensure only valid labels are returned
-        if "hate_speech" in result:
-            return "hate_speech"
-        elif "not_hate_speech" in result or "not hate_speech" in result:
-            return "not_hate_speech"
-        else:
-            # Default to the model's raw output if parsing fails
+        # Use the Gemini client to generate the classification
+        try:
+            client = st.session_state.genai_client
+            if client is None:
+                st.error("Gemini client not initialized. Please initialize Vertex AI API first.")
+                return "Error: Gemini client not initialized"
+                
+            response = client.models.generate_content(
+                model="gemini-2.5-flash-preview-04-17",
+                contents=rag_prompt
+            )
+            
+            # Extract and normalize classification
+            result = response.text.strip().lower()
+            
+            # Ensure only valid labels are returned
+            # if "hate_speech" in result:
+            #     return "hate_speech"
+            # elif "not_hate_speech" in result or "not hate_speech" in result:
+            #     return "not_hate_speech"
+            # else:
+                # Default to the model's raw output if parsing fails
             return result
+                
+        except Exception as model_error:
+            st.error(f"Error with Gemini model: {str(model_error)}")
+            st.error("This could be due to authentication issues or lack of permissions to use the model.")
+            return "Error: Model access failed"
     
     except Exception as e:
         st.error(f"Error classifying prompt: {str(e)}")
+        st.error(f"Traceback: {traceback.format_exc()}")
         return "Error: Classification failed"
 
 
-def batch_classify(dataset, vector_store, model_name, sample_size=None):
+def batch_classify(dataset, vector_store, sample_size=None):
     """Perform batch classification on dataset"""
     try:
         results = []
@@ -204,8 +410,12 @@ def batch_classify(dataset, vector_store, model_name, sample_size=None):
             # Get similar examples
             similar_examples = get_similar_prompts(vector_store, prompt)
             
+            # Check if similar_examples is None or empty
+            if similar_examples is None:
+                similar_examples = []
+            
             # Classify with RAG
-            predicted_label = classify_prompt_with_rag(prompt, similar_examples, model_name)
+            predicted_label = classify_prompt_with_rag(prompt, similar_examples)
             
             # Store result
             result = {
@@ -227,6 +437,7 @@ def batch_classify(dataset, vector_store, model_name, sample_size=None):
     
     except Exception as e:
         st.error(f"Error in batch classification: {str(e)}")
+        st.error(f"Traceback: {traceback.format_exc()}")
         return []
 
 
@@ -289,12 +500,15 @@ def calculate_metrics(results):
 # Main App UI
 st.title("🔍 RAG-based Hate Speech Classification")
 st.markdown("""
-This app uses Retrieval Augmented Generation (RAG) to classify text as hate speech or not hate speech.
+This app uses Retrieval Augmented Generation (RAG) with Gemini 2.0 Flash to classify text as hate speech or not hate speech.
 It retrieves similar examples from your dataset to provide context for the classification model.
 """)
 
 # Sidebar for configuration
 st.sidebar.title("Configuration")
+
+# Authentication setup
+auth_status = setup_authentication()
 
 # Google Cloud Configuration
 st.sidebar.header("Google Cloud Setup")
@@ -305,12 +519,8 @@ location = st.sidebar.selectbox(
     index=0,
     key="location_input"
 )
-model_name = st.sidebar.selectbox(
-    "Generative Model",
-    ["gemini-pro", "text-bison@002", "gemini-1.5-pro"],
-    index=0,
-    key="model_input"
-)
+
+st.sidebar.info("This app uses the Gemini 2.0 Flash model for classification.")
 
 # Initialize API button
 if st.sidebar.button("Initialize Vertex AI API"):
@@ -356,32 +566,53 @@ with tab1:
     if st.button("Classify"):
         if not st.session_state.api_initialized:
             st.error("Please initialize Vertex AI API first!")
+            st.info("Click the 'Initialize Vertex AI API' button in the sidebar after entering your project ID and selecting a location.")
         elif st.session_state.vector_store is None:
             st.error("Please create the vector store first!")
+            st.info("Upload a dataset and click the 'Create Vector Store' button in the sidebar.")
         elif user_prompt:
-            with st.spinner("Classifying..."):
-                # Get similar examples
-                similar_examples = get_similar_prompts(st.session_state.vector_store, user_prompt)
-                
-                # Classify with RAG
-                result = classify_prompt_with_rag(user_prompt, similar_examples, st.session_state.model_name)
-                
-                # Display result
-                st.subheader("Classification Result:")
-                if result == "hate_speech":
-                    st.error(f"Result: {result}")
-                else:
-                    st.success(f"Result: {result}")
-                
-                # Display similar examples
-                st.subheader("Similar Examples Used for Context:")
-                for i, example in enumerate(similar_examples):
-                    with st.expander(f"Example {i+1} - Similarity: {1 - example['similarity_score']:.4f}"):
-                        st.markdown(f"**Text:** {example['prompt']}")
-                        if example['label'] == "hate_speech":
-                            st.markdown(f"**Label:** 🚫 {example['label']}")
+            try:
+                with st.spinner("Classifying..."):
+                    # Get similar examples
+                    similar_examples = get_similar_prompts(st.session_state.vector_store, user_prompt)
+                    
+                    if similar_examples is None:
+                        st.error("Failed to retrieve similar examples. Vector store may not be properly initialized.")
+                        similar_examples = []
+                    
+                    # Classify with RAG
+                    result = classify_prompt_with_rag(user_prompt, similar_examples)
+                    
+                    # Check if classification was successful
+                    if result and not result.startswith("Error:"):
+                        # Display result
+                        st.subheader("Classification Result:")
+                        if result == "hate_speech":
+                            st.error(f"Result: {result}")
                         else:
-                            st.markdown(f"**Label:** ✅ {example['label']}")
+                            st.success(f"Result: {result}")
+                        
+                        # Display similar examples
+                        if similar_examples:
+                            st.subheader("Similar Examples Used for Context:")
+                            for i, example in enumerate(similar_examples):
+                                with st.expander(f"Example {i+1} - Similarity: {1 - example['similarity_score']:.4f}"):
+                                    st.markdown(f"**Text:** {example['prompt']}")
+                                    if example['label'] == "hate_speech":
+                                        st.markdown(f"**Label:** 🚫 {example['label']}")
+                                    else:
+                                        st.markdown(f"**Label:** ✅ {example['label']}")
+                        else:
+                            st.info("No similar examples were found in the dataset. Classification was performed without RAG context.")
+                    else:
+                        st.error(f"Classification failed: {result}")
+                        st.info("Check the error messages and make sure your authentication and API access are set up correctly.")
+            except Exception as e:
+                st.error(f"An unexpected error occurred: {str(e)}")
+                st.error("Debug information:")
+                st.error(f"- API initialized: {st.session_state.api_initialized}")
+                st.error(f"- Vector store type: {type(st.session_state.vector_store)}")
+                st.error(f"- GenAI client initialized: {st.session_state.genai_client is not None}")
         else:
             st.warning("Please enter a text prompt to classify!")
 
@@ -410,7 +641,6 @@ with tab2:
                 results = batch_classify(
                     st.session_state.dataset,
                     st.session_state.vector_store,
-                    st.session_state.model_name,
                     sample_size if sample_size > 0 else None
                 )
                 
@@ -496,5 +726,5 @@ with tab3:
 # Footer
 st.sidebar.markdown("---")
 st.sidebar.markdown(
-    "This app uses Google Cloud Vertex AI and RAG to classify text as hate speech or not hate speech."
+    "This app uses Google Cloud Vertex AI with Gemini 2.0 Flash and RAG to classify text as hate speech or not hate speech."
 )

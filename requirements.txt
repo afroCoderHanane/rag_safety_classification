@@ -1,0 +1,8 @@
+streamlit==1.31.0
+pandas==2.1.1
+vertexai==1.71.1
+google-cloud-aiplatform==1.89.0
+langchain==0.1.1
+langchain-google-vertexai==1.89.0
+langchain-community==1.0.0
+chromadb==0.4.22
