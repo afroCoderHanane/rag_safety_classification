@@ -20,8 +20,8 @@ This Streamlit application uses Retrieval Augmented Generation (RAG) to classify
 
 1. Clone this repository:
 ```bash
-git clone https://github.com/afroCoderHanane/rag_safety_classification.git
-cd rag_safety_classification
+git clone https://github.com/afroCoderHanane/rag-hate-speech-classification.git
+cd rag-hate-speech-classification
 ```
 
 2. Install the required packages:
@@ -32,6 +32,48 @@ pip install -r requirements.txt
 3. Set up Google Cloud authentication:
 ```bash
 gcloud auth application-default login
+```
+
+## Docker Installation
+
+You can also run the application and dataset generator using Docker.
+
+### Building the Docker Image
+
+```bash
+docker build -t rag-classifier .
+```
+
+### Running the Docker Container
+
+#### 1. Running the Streamlit App
+
+```bash
+docker run -p 8501:8501 -v $(pwd):/data rag-classifier app
+```
+
+Access the app in your browser at: http://localhost:8501
+
+#### 2. Generating a Hate Speech Dataset
+
+```bash
+docker run -v $(pwd):/data rag-classifier generate --samples=200 --output=/data/my_dataset.csv
+```
+
+Options:
+- `--samples=NUMBER`: Number of examples to generate (default: 200)
+- `--output=PATH`: Where to save the dataset (default: timestamped filename in container)
+
+### Using Docker Compose
+
+1. Start the application:
+```bash
+docker-compose up rag-app
+```
+
+2. Generate a dataset:
+```bash
+docker-compose run generator
 ```
 
 ## Dataset Format
