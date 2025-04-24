@@ -12,9 +12,6 @@ function print_help {
     echo "  --samples=NUMBER     Number of samples to generate (default: 200)"
     echo "  --output=FILENAME    Output filename (default: hate_speech_dataset_TIMESTAMP.csv)"
     echo ""
-    echo "Examples:"
-    echo "  docker run -p 8501:8501 rag-classifier app"
-    echo "  docker run -v $(pwd):/data rag-classifier generate --samples=500 --output=/data/my_dataset.csv"
 }
 
 # Default command is to run the Streamlit app
@@ -23,7 +20,9 @@ COMMAND=${1:-app}
 case "$COMMAND" in
     app)
         echo "Starting RAG Classification Streamlit app..."
-        streamlit run rag_app.py --server.port=8501 --server.address=0.0.0.0
+        # Use PORT environment variable from Cloud Run, default to 8501 if not set
+        export PORT=${PORT:-8501}
+        streamlit run rag_app.py --server.port=$PORT --server.address=0.0.0.0
         ;;
         
     generate)
